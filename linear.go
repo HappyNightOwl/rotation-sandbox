@@ -24,7 +24,7 @@ func (llama *LlamaInference) Linear(xPtr *rlwe.Ciphertext, wStr string, expand i
 	}
 	if expand <= 0 {
 		postProc = numSlots / hidDim
-		rotStep = preProc * preProc
+		rotStep = preProc * postProc
 	} else {
 		postProc = numSlots / expDim
 		rotStep = preProc * postProc

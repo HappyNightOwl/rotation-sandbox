@@ -479,9 +479,29 @@ func (helper *TestHelper) readWeightsLinear(name string, size *LlamaSize, llama 
 						poly[idx] = weightMatrix[(l + l / hidDim * batch) % expDim][(k + j * batch + i * inRot * batch + l + l / hidDim * batch) % hidDim]
 					}
 				} else {
+					// Down: weight is (hidDim, expDim), input is expDim, output is hidDim
+					// Key insight: idx calculation must use batchHid = numSlots/hidDim to match expand>0 pattern
+					// But k iterates over numSlots/expDim since input is packed at expDim density
+					batchHid := numSlots / hidDim  // = 4 when numSlots=128, hidDim=32
 					for l := 0; l < expDim; l++ {
-						idx := (k + l / hidDim * batch + batch * (expDim / hidDim) * (l % hidDim + i * inRot * batch)) % numSlots
-						poly[idx] = weightMatrix[(l + l / hidDim * batch) % hidDim][(k + j * batch + i * inRot * batch + l + l / hidDim * batch) % expDim]
+						// l maps to: outGroup = which output chunk, outPos = position within chunk
+						outGroup := l / hidDim  // 0 or 1
+						outPos := l % hidDim   // 0 to 31
+						// idx uses batchHid to match expand>0 slot layout
+						idx := (k + outGroup * batchHid + batchHid * (expDim / hidDim) * (outPos + i * inRot * batchHid)) % numSlots
+						// Row: output dimension, accounting for rotation
+						rowIdx := (outPos + i * inRot * batchHid) % hidDim
+						// Col: input dimension = outGroup * hidDim + outPos, plus rotation offset from k and j
+						// k ranges over numSlots/expDim, j ranges over inRot
+						// Rotation offset: k * (expDim/numSlots) * expDim + j * (expDim/numSlots) * numSlots?
+						// Simpler: colIdx = outGroup * hidDim + outPos + k * (hidDim/(numSlots/expDim)) + j * (numSlots/expDim)?
+						// Actually, look at expand>0: colIdx = (k + j*batch + i*inRot*batch + l + l/hidDim*batch) % hidDim
+						// For expand=-1, symmetric: colIdx = (k * (expDim/numSlots) + j * batch + ...) % expDim?
+						// Let me try: k contributes expDim/(numSlots/hidDim) = expDim*hidDim/numSlots = hidDim/(numSlots/expDim)
+						// batchInput = numSlots / expDim
+						// colIdx = outGroup * hidDim + outPos + k * (hidDim/batch) + j * batch?
+						colIdx := (outGroup*hidDim + outPos + k*(hidDim/(numSlots/expDim)) + j*(numSlots/expDim)) % expDim
+						poly[idx] = weightMatrix[rowIdx][colIdx]
 					}
 				}
 			}
