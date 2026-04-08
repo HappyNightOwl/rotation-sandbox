@@ -12,13 +12,13 @@ import (
 var (
 	logN     = flag.Int("logN", 8, "logarithm of polynomial degree")
 	test     = flag.String("test", "Decoder", "the module to test")
-	level    = flag.Int("level", 6, "input level of the module")
+	level    = flag.Int("level", 16, "input level of the module")
 	btpLevel = flag.Int("btpLevel", 15, "bootstrap level of the module, limited to Norm and Softmax")
 	hidDim   = flag.Int("hidDim", 32, "hidden dimension of the model")
 	expDim   = flag.Int("expDim", 64, "expanded hidden dimension of the model")
 	seqLen   = flag.Int("seqLen", 29, "input sequence length")
 	numHeads = flag.Int("numHeads", 2, "number of heads")
-	parallel  = flag.Bool("parallel", false, "use parallel computing or not")
+	parallel = flag.Bool("parallel", false, "use parallel computing or not")
 )
 
 func main() {
@@ -26,7 +26,7 @@ func main() {
 
 	params, err := ckks.NewParametersFromLiteral(ckks.ParametersLiteral{
 		LogN:            *logN,
-		LogQ:            []int{53, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41},
+		LogQ:            []int{53, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41},
 		LogP:            []int{61, 61, 61, 61},
 		LogDefaultScale: 41,
 		Xs:              ring.Ternary{H: 192},
@@ -135,8 +135,8 @@ func main() {
 		// fmt.Printf("Plaintext argmax: %d\n", llama.ArgmaxPlaintext(llama.helper.Dec(x, 0)))
 		pt := llama.ArgmaxPlaintext(llama.helper.Dec(x, 0))
 		fmt.Print("Plaintext argmax: ")
-		for _, val := range(pt) {
-			fmt.Printf("%d+%di; ", val % 16, val / 16)
+		for _, val := range pt {
+			fmt.Printf("%d+%di; ", val%16, val/16)
 		}
 		fmt.Print("\n")
 		llama.helper.Dec(llama.Argmax(x), 8)
@@ -160,7 +160,7 @@ func main() {
 	case "Model":
 		fmt.Printf("Preparing model...\n")
 		helper.PrepareWeights(size, []string{"q", "k", "v", "out", "up", "gate", "down", "RoPE"}, llama)
-		helper.PrepareCache(size, []string{"k", "v", "mask"}, llama)
+		helper.PrepareCache(size, []string{"k", "v"}, llama)
 		fmt.Printf("Preparation finished!\nEvaluating End-to-end Inference!\n")
 		llama.Model(x)
 	default:
