@@ -322,6 +322,26 @@ func (helper *TestHelper) MSE(msg1 []complex128, msg2 []complex128) (d float64) 
 
 // Neg negates a ciphertext in-place without changing its scale
 // This is more efficient than multiplying by -1 as it avoids rescaling
+// GetEncoder returns the CKKS encoder
+func (helper *TestHelper) GetEncoder() *ckks.Encoder {
+	return helper.encoder
+}
+
+// GetEncryptor returns the RLWE encryptor
+func (helper *TestHelper) GetEncryptor() *rlwe.Encryptor {
+	return helper.encryptor
+}
+
+// GetDecryptor returns the RLWE decryptor
+func (helper *TestHelper) GetDecryptor() *rlwe.Decryptor {
+	return helper.decryptor
+}
+
+// GetParams returns the CKKS parameters
+func (helper *TestHelper) GetParams() *ckks.Parameters {
+	return helper.params
+}
+
 func (helper *TestHelper) Neg(eval *ckks.Evaluator, ct *rlwe.Ciphertext) {
 	level := ct.Level()
 	ringQ := helper.params.RingQ().AtLevel(level)
