@@ -10,36 +10,85 @@ import (
 )
 
 var (
-	logN     = flag.Int("logN", 8, "logarithm of polynomial degree")
-	test     = flag.String("test", "Decoder", "the module to test")
-	level    = flag.Int("level", 16, "input level of the module")
-	btpLevel = flag.Int("btpLevel", 15, "bootstrap level of the module, limited to Norm and Softmax")
-	hidDim   = flag.Int("hidDim", 32, "hidden dimension of the model")
-	expDim   = flag.Int("expDim", 64, "expanded hidden dimension of the model")
-	seqLen   = flag.Int("seqLen", 29, "input sequence length")
-	numHeads = flag.Int("numHeads", 2, "number of heads")
+	// 原有的 flag 现在用于覆盖配置文件中的值
+	logN     = flag.Int("logN", 8, "logarithm of polynomial degree (overrides config)")
+	test     = flag.String("test", "", "the module to test (overrides config)")
+	level    = flag.Int("level", 16, "input level of the module (overrides config)")
+	btpLevel = flag.Int("btpLevel", 15, "bootstrap level of the module, limited to Norm and Softmax (overrides config)")
+	hidDim   = flag.Int("hidDim", 32, "hidden dimension of the model (overrides config)")
+	expDim   = flag.Int("expDim", 64, "expanded hidden dimension of the model (overrides config)")
+	seqLen   = flag.Int("seqLen", 29, "input sequence length (overrides config)")
+	numHeads = flag.Int("numHeads", 2, "number of heads (overrides config)")
 	parallel = flag.Bool("parallel", false, "use parallel computing or not")
+
+	// 新增：配置文件路径
+	configPath = flag.String("config", "config.json", "path to configuration file")
+	// 新增：生成默认配置文件模板
+	generateConfig = flag.String("gen-config", "", "generate default config template to specified path and exit")
 )
 
 func main() {
 	flag.Parse()
 
+	// 如果指定了生成配置文件，生成后退出
+	if *generateConfig != "" {
+		if err := SaveConfig(*generateConfig, DefaultConfig()); err != nil {
+			panic(fmt.Sprintf("Failed to generate config: %v", err))
+		}
+		fmt.Printf("Default configuration template generated at: %s\n", *generateConfig)
+		return
+	}
+
+	// 加载配置（配置文件不存在则使用默认值）
+	config, err := LoadConfig(*configPath)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to load config: %v", err))
+	}
+
+	// 应用命令行 flag 覆盖（如果显式设置）
+	overrides := &FlagOverrides{
+		LogN:     logN,
+		HidDim:   hidDim,
+		ExpDim:   expDim,
+		SeqLen:   seqLen,
+		NumHeads: numHeads,
+		Level:    level,
+		BtpLevel: btpLevel,
+		Test:     test,
+		Parallel: parallel,
+	}
+	config.ApplyOverrides(overrides)
+
+	// 打印当前配置（便于调试）
+	fmt.Printf("=== Running with Configuration ===\n")
+	fmt.Printf("Model: hidDim=%d, expDim=%d, numHeads=%d, seqLen=%d\n",
+		config.Model.HiddenDim, config.Model.ExpandedDim, config.Model.NumHeads, config.Model.SeqLen)
+	fmt.Printf("Crypto: logN=%d, logDefaultScale=%d\n",
+		config.Crypto.LogN, config.Crypto.LogDefaultScale)
+	fmt.Printf("Runtime: test=%s, level=%d, btpLevel=%d, parallel=%v\n",
+		config.Runtime.TestModule, config.Runtime.Level, config.Runtime.BtpLevel, config.Runtime.Parallel)
+	fmt.Printf("==================================\n\n")
+
+	// 使用配置创建 CKKS 参数
 	params, err := ckks.NewParametersFromLiteral(ckks.ParametersLiteral{
-		LogN:            *logN,
-		LogQ:            []int{53, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41},
-		LogP:            []int{61, 61, 61, 61},
-		LogDefaultScale: 41,
-		Xs:              ring.Ternary{H: 192},
+		LogN:            config.Crypto.LogN,
+		LogQ:            config.Crypto.LogQ,
+		LogP:            config.Crypto.LogP,
+		LogDefaultScale: config.Crypto.LogDefaultScale,
+		Xs:              ring.Ternary{H: config.Crypto.XsH},
 	})
 	if err != nil {
 		panic(err)
 	}
+
 	btpParametersLit := bootstrapping.ParametersLiteral{
-		LogN: logN,
-		LogP: []int{61, 61, 61, 61},
+		LogN: &config.Crypto.LogN,
+		LogP: config.Bootstrapping.LogP,
 		Xs:   params.Xs(),
 	}
-	llama, helper, size, opeval := PrepareContext(params, btpParametersLit)
+
+	// 传递配置到 PrepareContext
+	llama, helper, size, opeval := PrepareContextWithConfig(params, btpParametersLit, config)
 
 	fmt.Print("Initialization finished!\n")
 	x := helper.ctGen(1)[0]
@@ -49,7 +98,8 @@ func main() {
 	for i := 0; i < size.hidDim; i++ {
 		xMsg[i] = xDec[i*x.Slots()/size.hidDim]
 	}
-	switch *test {
+
+	switch config.Runtime.TestModule {
 	case "QKV":
 		helper.PrepareWeights(size, []string{"q", "k", "v"}, llama)
 		qCt, _, _ := llama.QKV(x)
@@ -121,11 +171,11 @@ func main() {
 		llama.helper.MSE(y, y_pt)
 	case "Softmax":
 		y_pt := llama.SoftmaxPlaintext(llama.helper.Dec(x, 0))
-		y := llama.helper.Dec(llama.Softmax(x, *btpLevel, 0), 0)
+		y := llama.helper.Dec(llama.Softmax(x, config.Runtime.BtpLevel, 0), 0)
 		llama.helper.MSE(y, y_pt)
 	case "Norm":
 		y_pt := llama.NormPlaintext(llama.helper.Dec(x, 0))
-		y := llama.helper.Dec(llama.Norm(x, *btpLevel), 0)
+		y := llama.helper.Dec(llama.Norm(x, config.Runtime.BtpLevel), 0)
 		llama.helper.MSE(y, y_pt)
 	case "NormThor":
 		y_pt := llama.NormPlaintext(llama.helper.Dec(x, 0))

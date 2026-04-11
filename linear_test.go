@@ -65,36 +65,50 @@ func precisionBitsFromMSE(mse float64) float64 {
 func setupStage1Context(t *testing.T) *stage1Context {
 	t.Helper()
 
-	oldTest, oldLogN, oldLevel := *test, *logN, *level
-	oldHidDim, oldExpDim, oldSeqLen, oldNumHeads := *hidDim, *expDim, *seqLen, *numHeads
-	oldParallel := *parallel
-
-	*test = "Decoder"
-	*parallel = false
-	*logN = 8
-	*level = 6
-	*hidDim = Stage1HidDim
-	*expDim = Stage1ExpDim
-	*seqLen = Stage1SeqLen
-	*numHeads = Stage1NumHeads
+	// 检查是否通过环境变量指定了配置文件（覆盖默认）
+	configPath := os.Getenv("CACHEMIR_CONFIG")
+	if configPath == "" {
+		configPath = "config.json" // 默认使用 config.json
+	}
+	
+	// 加载配置，如果文件不存在则使用默认配置
+	config, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("failed to load config from %s: %v", configPath, err)
+	}
+	
+	// 如果配置文件不存在，使用测试特定的默认值
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		config.Runtime.TestModule = "Decoder"
+		config.Runtime.Level = 6
+		config.Model.HiddenDim = Stage1HidDim
+		config.Model.ExpandedDim = Stage1ExpDim
+		config.Model.SeqLen = Stage1SeqLen
+		config.Model.NumHeads = Stage1NumHeads
+		t.Logf("Config file not found, using default test values: hidDim=%d, expDim=%d, numHeads=%d, seqLen=%d",
+			config.Model.HiddenDim, config.Model.ExpandedDim, config.Model.NumHeads, config.Model.SeqLen)
+	} else {
+		t.Logf("Using config from %s: hidDim=%d, expDim=%d, numHeads=%d, seqLen=%d",
+			configPath, config.Model.HiddenDim, config.Model.ExpandedDim, config.Model.NumHeads, config.Model.SeqLen)
+	}
 
 	params, err := ckks.NewParametersFromLiteral(ckks.ParametersLiteral{
-		LogN:            *logN,
-		LogQ:            []int{53, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41},
-		LogP:            []int{61, 61, 61, 61},
-		LogDefaultScale: 41,
-		Xs:              ring.Ternary{H: 192},
+		LogN:            config.Crypto.LogN,
+		LogQ:            config.Crypto.LogQ,
+		LogP:            config.Crypto.LogP,
+		LogDefaultScale: config.Crypto.LogDefaultScale,
+		Xs:              ring.Ternary{H: config.Crypto.XsH},
 	})
 	if err != nil {
 		t.Fatalf("failed to create CKKS parameters: %v", err)
 	}
 	bpLit := bootstrapping.ParametersLiteral{
-		LogN: logN,
-		LogP: []int{61, 61, 61, 61},
+		LogN: &config.Crypto.LogN,
+		LogP: config.Bootstrapping.LogP,
 		Xs:   params.Xs(),
 	}
 
-	llama, helper, size, _ := PrepareContext(params, bpLit)
+	llama, helper, size, _ := PrepareContextWithConfig(params, bpLit, config)
 	helper.PrepareWeights(size, []string{"q", "k", "v", "out", "up", "gate", "down", "RoPE"}, llama)
 	helper.PrepareCache(size, []string{"k", "v"}, llama)
 
@@ -115,10 +129,6 @@ func setupStage1Context(t *testing.T) *stage1Context {
 		}
 	}
 	assertMode := os.Getenv("CACHEMIR_ASSERT") != "0"
-
-	*test, *logN, *level = oldTest, oldLogN, oldLevel
-	*hidDim, *expDim, *seqLen, *numHeads = oldHidDim, oldExpDim, oldSeqLen, oldNumHeads
-	*parallel = oldParallel
 
 	return &stage1Context{
 		params: params,

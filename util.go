@@ -174,6 +174,72 @@ func PrepareContext(params ckks.Parameters, btpParametersLit bootstrapping.Param
 	return llama, helper, size, opeval
 }
 
+// PrepareContextWithConfig 使用配置文件创建上下文
+func PrepareContextWithConfig(params ckks.Parameters, btpParametersLit bootstrapping.ParametersLiteral, config *Config) (llama *LlamaInference, helper *TestHelper, size *LlamaSize, opeval *OperationEvaluator) {
+	fmt.Print("Preparing context with config...\n")
+
+	kgen := rlwe.NewKeyGenerator(params)
+	sk, pk := kgen.GenKeyPairNew()
+	encoder := ckks.NewEncoder(params)
+	encryptor := rlwe.NewEncryptor(params, pk)
+	decryptor := rlwe.NewDecryptor(params, sk)
+	rlk := kgen.GenRelinearizationKeyNew(sk)
+
+	num_eval := 1
+	if config.Runtime.Parallel {
+		num_eval = runtime.GOMAXPROCS(0)
+	}
+	eval := make([]*ckks.Evaluator, num_eval)
+	galEls := []uint64{params.GaloisElementForComplexConjugation()}
+	for i := 1; i < params.MaxSlots(); i *= 2 {
+		galEls = append(galEls, params.GaloisElement(i))
+	}
+	// Generate Galois keys once and share across all evaluators (keys are read-only)
+	sharedEvk := rlwe.NewMemEvaluationKeySet(rlk, kgen.GenGaloisKeysNew(galEls, sk)...)
+	for i := range eval {
+		eval[i] = ckks.NewEvaluator(params, sharedEvk)
+	}
+
+	var btpEval *bootstrapping.Evaluator
+	btpParams, _ := bootstrapping.NewParametersFromLiteral(params, btpParametersLit)
+	testModule := config.Runtime.TestModule
+	if testModule == "Softmax" || testModule == "Norm" || testModule == "Model" || testModule == "Decoder" || testModule == "NormThor" {
+		btpEvk, _, _ := btpParams.GenEvaluationKeys(sk)
+		btpEval, _ = bootstrapping.NewEvaluator(btpParams, btpEvk)
+	}
+
+	helper = &TestHelper{encoder: encoder, encryptor: encryptor, decryptor: decryptor, params: &params}
+	size = config.Model.ToLlamaSize()
+	llama = &LlamaInference{
+		size:    size,
+		eval:    eval,
+		btpEval: btpEval,
+		params:  &params,
+		helper:  helper,
+		w:       make(map[string][]*rlwe.Plaintext),
+		cache:   make(map[string][]*rlwe.Ciphertext),
+		mask:    make(map[string][]*rlwe.Plaintext),
+	}
+	fmt.Printf("Residual parameters: logN=%d, logSlots=%d, H=%d, sigma=%f, logQP=%f, levels=%d, scale=2^%d\n",
+		btpParams.ResidualParameters.LogN(),
+		btpParams.ResidualParameters.LogMaxSlots(),
+		btpParams.ResidualParameters.XsHammingWeight(),
+		btpParams.ResidualParameters.Xe(), params.LogQP(),
+		btpParams.ResidualParameters.MaxLevel(),
+		btpParams.ResidualParameters.LogDefaultScale())
+	fmt.Printf("Bootstrapping parameters: logN=%d, logSlots=%d, H(%d; %d), sigma=%f, logQP=%f, levels=%d, scale=2^%d\n",
+		btpParams.BootstrappingParameters.LogN(),
+		btpParams.BootstrappingParameters.LogMaxSlots(),
+		btpParams.BootstrappingParameters.XsHammingWeight(),
+		btpParams.EphemeralSecretWeight,
+		btpParams.BootstrappingParameters.Xe(),
+		btpParams.BootstrappingParameters.LogQP(),
+		btpParams.BootstrappingParameters.QCount(),
+		btpParams.BootstrappingParameters.LogDefaultScale())
+
+	return llama, helper, size, opeval
+}
+
 type TestHelper struct {
 	encoder   *ckks.Encoder
 	encryptor *rlwe.Encryptor

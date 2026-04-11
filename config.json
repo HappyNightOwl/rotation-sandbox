@@ -1,0 +1,24 @@
+{
+  "model": {
+    "hidDim": 32,
+    "expDim": 64,
+    "numHeads": 2,
+    "seqLen": 29
+  },
+  "crypto": {
+    "logN": 8,
+    "logDefaultScale": 41,
+    "logQ": [53, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41],
+    "logP": [61, 61, 61, 61],
+    "xsH": 192
+  },
+  "bootstrapping": {
+    "logP": [61, 61, 61, 61]
+  },
+  "runtime": {
+    "test": "Decoder",
+    "level": 16,
+    "btpLevel": 15,
+    "parallel": false
+  }
+}
