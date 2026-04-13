@@ -1,9 +1,9 @@
 {
   "model": {
-    "hidDim": 32,
-    "expDim": 64,
+    "hidDim": 17,
+    "expDim": 50,
     "numHeads": 2,
-    "seqLen": 29
+    "seqLen": 31
   },
   "crypto": {
     "logN": 8,

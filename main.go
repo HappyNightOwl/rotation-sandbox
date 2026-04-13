@@ -59,6 +59,23 @@ func main() {
 	}
 	config.ApplyOverrides(overrides)
 
+	// ===== Phase 1: 自动维度对齐 =====
+	// 在创建 CKKS 参数前，对齐模型维度以满足 numSlots 整除约束
+	numSlots := 1 << config.Crypto.LogN // 2^LogN
+	compat := NewDimensionCompat(numSlots)
+	aligned := compat.AlignLlamaSize(LlamaSize{
+		hidDim:   config.Model.HiddenDim,
+		expDim:   config.Model.ExpandedDim,
+		seqLen:   config.Model.SeqLen,
+		numHeads: config.Model.NumHeads,
+	})
+	// 应用对齐后的维度
+	config.Model.HiddenDim = aligned.HidDim.Aligned
+	config.Model.ExpandedDim = aligned.ExpDim.Aligned
+	// 打印对齐信息
+	compat.PrintAlignmentInfo(aligned)
+	// ================================
+
 	// 打印当前配置（便于调试）
 	fmt.Printf("=== Running with Configuration ===\n")
 	fmt.Printf("Model: hidDim=%d, expDim=%d, numHeads=%d, seqLen=%d\n",
@@ -213,6 +230,12 @@ func main() {
 		helper.PrepareCache(size, []string{"k", "v"}, llama)
 		fmt.Printf("Preparation finished!\nEvaluating End-to-end Inference!\n")
 		llama.Model(x)
+	case "ModelPlaintext":
+		fmt.Printf("Preparing model with plaintext non-linear operations...\n")
+		helper.PrepareWeights(size, []string{"q", "k", "v", "out", "up", "gate", "down", "RoPE"}, llama)
+		helper.PrepareCache(size, []string{"k", "v"}, llama)
+		fmt.Printf("Preparation finished!\nEvaluating End-to-end Inference with plaintext non-linear ops!\n")
+		llama.ModelPlaintext(x)
 	default:
 		fmt.Print("Please specify the module to evaluate.")
 	}

@@ -162,11 +162,15 @@ go test -v -run "TestStage1" ./...
 
 ### 仅运行特定测试
 ```bash
-# 仅测试线性投影
+# 测试所有线性层
 go test -v -run TestStage1_LinearPipelineMSE
-
-# 仅测试 Attention 模块
-go test -v -run TestStage1_AttentionOnly
+# 测试特定的线性层
+go test -v -run TestStage1_LinearPipelineMSE/QProjection    # Q 投影
+go test -v -run TestStage1_LinearPipelineMSE/KProjection    # K 投影
+go test -v -run TestStage1_LinearPipelineMSE/VProjection    # V 投影
+go test -v -run TestStage1_LinearPipelineMSE/OutProjection  # Out 投影
+go test -v -run TestStage1_LinearPipelineMSE/UpGateProjection  # Up/Gate 投影
+go test -v -run TestStage1_LinearPipelineMSE/DownProjection    # Down 投影
 ```
 
 ### 调整精度阈值运行

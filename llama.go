@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"time"
 	"math/big"
+	"time"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/polynomial"
@@ -26,24 +26,24 @@ type SiluFunc struct {
 }
 
 type NormFunc struct {
-	config	  LayerNormConfig
-	gamma     *rlwe.Ciphertext
-	beta 	  *rlwe.Ciphertext
+	config LayerNormConfig
+	gamma  *rlwe.Ciphertext
+	beta   *rlwe.Ciphertext
 }
 
 type LlamaInference struct {
-	params    *ckks.Parameters
-	size      *LlamaSize
-	eval      []*ckks.Evaluator
-	btpEval   *bootstrapping.Evaluator
-	siluFunc  *SiluFunc
-	normFunc  *NormFunc
-	helper    *TestHelper
-	w         map[string][]*rlwe.Plaintext
-	wMsg	  map[string][][]complex128
-	cache     map[string][]*rlwe.Ciphertext
-	cacheMsg  map[string][][]complex128
-	mask      map[string][]*rlwe.Plaintext
+	params   *ckks.Parameters
+	size     *LlamaSize
+	eval     []*ckks.Evaluator
+	btpEval  *bootstrapping.Evaluator
+	siluFunc *SiluFunc
+	normFunc *NormFunc
+	helper   *TestHelper
+	w        map[string][]*rlwe.Plaintext
+	wMsg     map[string][][]complex128
+	cache    map[string][]*rlwe.Ciphertext
+	cacheMsg map[string][][]complex128
+	mask     map[string][]*rlwe.Plaintext
 }
 
 func (llama *LlamaInference) DecoderMoai(x *rlwe.Ciphertext) (y *rlwe.Ciphertext) {
@@ -322,6 +322,21 @@ func (llama *LlamaInference) Model(x *rlwe.Ciphertext) (y *rlwe.Ciphertext) {
 	y = x
 	modelElapsed := time.Since(modelStart)
 	fmt.Print("Model completed!\n")
+	fmt.Printf("Consumed %f seconds for the whole model.\n", modelElapsed.Seconds())
+
+	return y
+}
+
+// ModelPlaintext runs the full 32-layer model with non-linear operations in plaintext
+func (llama *LlamaInference) ModelPlaintext(x *rlwe.Ciphertext) (y *rlwe.Ciphertext) {
+	modelStart := time.Now()
+	for i := 0; i < 32; i++ {
+		fmt.Printf("Computing the %d-th decoder with plaintext non-linear operations...", i)
+		x = llama.DecoderPlaintext(x)
+	}
+	y = x
+	modelElapsed := time.Since(modelStart)
+	fmt.Print("Model with plaintext non-linear operations completed!\n")
 	fmt.Printf("Consumed %f seconds for the whole model.\n", modelElapsed.Seconds())
 
 	return y

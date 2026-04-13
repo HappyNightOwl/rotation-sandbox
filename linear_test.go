@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
@@ -70,13 +71,13 @@ func setupStage1Context(t *testing.T) *stage1Context {
 	if configPath == "" {
 		configPath = "config.json" // 默认使用 config.json
 	}
-	
+
 	// 加载配置，如果文件不存在则使用默认配置
 	config, err := LoadConfig(configPath)
 	if err != nil {
 		t.Fatalf("failed to load config from %s: %v", configPath, err)
 	}
-	
+
 	// 如果配置文件不存在，使用测试特定的默认值
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		config.Runtime.TestModule = "Decoder"
@@ -102,6 +103,18 @@ func setupStage1Context(t *testing.T) *stage1Context {
 	if err != nil {
 		t.Fatalf("failed to create CKKS parameters: %v", err)
 	}
+
+	numSlots := params.MaxSlots()
+	compat := NewDimensionCompat(numSlots)
+	aligned := compat.AlignLlamaSize(LlamaSize{
+		hidDim:   config.Model.HiddenDim,
+		expDim:   config.Model.ExpandedDim,
+		seqLen:   config.Model.SeqLen,
+		numHeads: config.Model.NumHeads,
+	})
+	config.Model.HiddenDim = aligned.HidDim.Aligned
+	config.Model.ExpandedDim = aligned.ExpDim.Aligned
+
 	bpLit := bootstrapping.ParametersLiteral{
 		LogN: &config.Crypto.LogN,
 		LogP: config.Bootstrapping.LogP,
@@ -579,4 +592,61 @@ func encryptFromSlots(t *testing.T, c *stage1Context, values []complex128, dim, 
 		t.Fatalf("encrypt failed: %v", err)
 	}
 	return ct
+}
+
+// TestStage1_ModelPlaintext tests the full 32-layer model with plaintext non-linear operations
+func TestStage1_ModelPlaintext(t *testing.T) {
+	c := setupStage1Context(t)
+	xCt, xMsg := makeStage1Input(t, c, 0, c.size.hidDim, c.hidStr)
+
+	t.Run("Full32LayerModelWithPlaintextNonlinear", func(t *testing.T) {
+		helpers := c.llama.helper
+		helpers.PrepareWeights(c.size, []string{"q", "k", "v", "out", "up", "gate", "down", "RoPE"}, c.llama)
+		helpers.PrepareCache(c.size, []string{"k", "v"}, c.llama)
+
+		t.Logf("Prepared weights for 32-layer model")
+
+		start := time.Now()
+		yCt := c.llama.ModelPlaintext(xCt.CopyNew())
+		elapsed := time.Since(start)
+
+		t.Logf("ModelPlaintext completed in %f seconds", elapsed.Seconds())
+
+		yResult := takeByStride(c.helper.Dec(yCt, 0), c.size.hidDim, c.hidStr)
+
+		for i := 0; i < 32; i++ {
+			xMsg = c.llama.DecoderMsg(xMsg)
+		}
+
+		assertMSE(t, c, "Full32LayerModelPlaintext", yResult, xMsg)
+	})
+
+	t.Run("PerLayerErrorAnalysis", func(t *testing.T) {
+		helpers := c.llama.helper
+		helpers.PrepareWeights(c.size, []string{"q", "k", "v", "out", "up", "gate", "down", "RoPE"}, c.llama)
+		helpers.PrepareCache(c.size, []string{"k", "v"}, c.llama)
+
+		currentCt := xCt.CopyNew()
+		currentMsg := make([]complex128, len(xMsg))
+		copy(currentMsg, xMsg)
+
+		t.Logf("Starting per-layer error analysis...")
+
+		for layer := 0; layer < 32; layer++ {
+			outCt := c.llama.DecoderPlaintext(currentCt.CopyNew())
+
+			currentMsg = c.llama.DecoderMsg(currentMsg)
+
+			outResult := takeByStride(c.helper.Dec(outCt, 0), c.size.hidDim, c.hidStr)
+
+			mse, _ := stage1MSE(outResult, currentMsg)
+			precision := precisionBitsFromMSE(mse)
+
+			t.Logf("Layer %02d | MSE=%.3e | precision=%.2f bits", layer, mse, precision)
+
+			currentCt = outCt
+		}
+
+		t.Logf("Per-layer analysis completed")
+	})
 }
