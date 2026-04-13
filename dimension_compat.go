@@ -5,12 +5,6 @@
 //
 // Phase 1: 自动维度对齐 - 调整配置参数使其满足整除约束
 // Phase 2: Zero-Padding 处理 - 在数据层面处理对齐，支持真实任意维度
-//
-// Usage:
-//   compat := NewDimensionCompat(params.MaxSlots())
-//   alignedSize := compat.AlignLlamaSize(originalSize)  // Phase 1
-//   // 或
-//   handler := compat.NewPaddingHandler(originalSize)    // Phase 2
 
 package main
 
@@ -234,10 +228,35 @@ func (dc *DimensionCompat) PrintAlignmentInfo(aligned AlignedLlamaSize) {
 // Phase 2: Zero-Padding 处理（预留接口，待实现）
 // =============================================================================
 
+// =============================================================================
+// Phase 2: Zero-Padding 处理
+// =============================================================================
+
 // NewPaddingHandler 创建 Padding 处理器（Phase 2 入口）
+// Phase 2 核心：不改变模型参数，而是在数据层面进行 padding 处理
+// 这样用户可以指定任意维度（如 hidDim=17），系统自动处理到 numSlots 对齐
 func (dc *DimensionCompat) NewPaddingHandler(size *LlamaSize) *PaddingHandler {
-	if dc.mode != ModePadding {
-		fmt.Println("⚠️  Warning: Creating PaddingHandler but mode is not ModePadding")
+	// 计算需要的 padding 维度（下一个能整除 numSlots 的值）
+	paddedSize := *size
+
+	// 计算 hidDim 需要 padding 到的维度
+	if numSlots := dc.numSlots; numSlots%size.hidDim != 0 {
+		for d := size.hidDim + 1; d <= numSlots; d++ {
+			if numSlots%d == 0 {
+				paddedSize.hidDim = d
+				break
+			}
+		}
+	}
+
+	// 计算 expDim 需要 padding 到的维度
+	if numSlots := dc.numSlots; numSlots%size.expDim != 0 {
+		for d := size.expDim + 1; d <= numSlots; d++ {
+			if numSlots%d == 0 {
+				paddedSize.expDim = d
+				break
+			}
+		}
 	}
 
 	// 保存原始尺寸
@@ -250,44 +269,81 @@ func (dc *DimensionCompat) NewPaddingHandler(size *LlamaSize) *PaddingHandler {
 
 	return &PaddingHandler{
 		compat:   dc,
-		size:     size,
+		size:     &paddedSize,
 		original: original,
 	}
 }
 
-// Phase 2 接口预留（TODO: 后续实现）
-// 这些函数将在 Phase 2 中完整实现
-
 // PadInputVector 对输入向量进行 Zero-Padding
-// Phase 2 TODO: 实现向量padding逻辑
+// 将原始维度 padding 到能整除 numSlots 的维度
 func (ph *PaddingHandler) PadInputVector(input []complex128, targetDim int) []complex128 {
-	// Phase 2: 实现padding逻辑
-	// 目前直接返回原向量（向下兼容）
-	return input
+	if len(input) >= targetDim {
+		return input[:targetDim]
+	}
+
+	// 创建 padded 向量，尾部补零
+	padded := make([]complex128, targetDim)
+	copy(padded, input)
+	// 剩余部分默认为零（complex128零值）
+	return padded
 }
 
 // UnpadOutputVector 从 padded 输出中提取有效部分
-// Phase 2 TODO: 实现去padding逻辑
+// 从 padding 后的维度恢复到原始维度
 func (ph *PaddingHandler) UnpadOutputVector(output []complex128, originalDim int) []complex128 {
-	// Phase 2: 实现去padding逻辑
-	// 目前直接截取前originalDim个元素
-	if len(output) > originalDim {
+	if len(output) >= originalDim {
 		return output[:originalDim]
 	}
+	// 如果输出比原始维度还小，直接返回
 	return output
 }
 
 // PadWeightMatrix 对权重矩阵进行 Zero-Padding
-// Phase 2 TODO: 实现矩阵padding逻辑
+// 将原始 (rows, cols) 的矩阵 padding 到 (targetRows, targetCols)
 func (ph *PaddingHandler) PadWeightMatrix(matrix [][]complex128, targetRows, targetCols int) [][]complex128 {
-	// Phase 2: 实现矩阵padding逻辑
-	// 目前直接返回原矩阵
-	return matrix
+	originalRows := len(matrix)
+	originalCols := 0
+	if originalRows > 0 {
+		originalCols = len(matrix[0])
+	}
+
+	// 创建 padded 矩阵
+	padded := make([][]complex128, targetRows)
+	for i := 0; i < targetRows; i++ {
+		padded[i] = make([]complex128, targetCols)
+		// 复制原始数据
+		if i < originalRows {
+			copyLen := originalCols
+			if copyLen > targetCols {
+				copyLen = targetCols
+			}
+			for j := 0; j < copyLen; j++ {
+				padded[i][j] = matrix[i][j]
+			}
+		}
+		// 超出原始行/列的部分保持为零
+	}
+	return padded
 }
 
-// GetEffectiveDimensions 获取实际计算使用的有效维度
-// Phase 2: 返回 padding 后的维度
-// Phase 1: 返回对齐后的维度
+// UnpadWeightMatrix 从 padded 矩阵中提取有效部分
+func (ph *PaddingHandler) UnpadWeightMatrix(paddedMatrix [][]complex128, originalRows, originalCols int) [][]complex128 {
+	if len(paddedMatrix) >= originalRows {
+		result := make([][]complex128, originalRows)
+		for i := 0; i < originalRows; i++ {
+			result[i] = make([]complex128, originalCols)
+			if len(paddedMatrix[i]) >= originalCols {
+				copy(result[i], paddedMatrix[i][:originalCols])
+			} else {
+				copy(result[i], paddedMatrix[i])
+			}
+		}
+		return result
+	}
+	return paddedMatrix
+}
+
+// GetEffectiveDimensions 获取 padding 后的有效维度
 func (ph *PaddingHandler) GetEffectiveDimensions() LlamaSize {
 	return *ph.size
 }
@@ -295,6 +351,97 @@ func (ph *PaddingHandler) GetEffectiveDimensions() LlamaSize {
 // GetOriginalDimensions 获取原始用户指定的维度
 func (ph *PaddingHandler) GetOriginalDimensions() LlamaSize {
 	return ph.original
+}
+
+// GetPaddingInfo 获取 padding 信息
+func (ph *PaddingHandler) GetPaddingInfo() (origHidDim, paddedHidDim, origExpDim, paddedExpDim int) {
+	return ph.original.hidDim, ph.size.hidDim, ph.original.expDim, ph.size.expDim
+}
+
+// =============================================================================
+// Phase 2 包装层：用于集成到现有代码
+// =============================================================================
+
+// Phase2Wrapper Phase 2 包装器，提供透明的数据转换
+type Phase2Wrapper struct {
+	handler  *PaddingHandler
+	numSlots int
+	enabled  bool
+}
+
+// NewPhase2Wrapper 创建 Phase 2 包装器
+func NewPhase2Wrapper(numSlots int, originalSize *LlamaSize) *Phase2Wrapper {
+	compat := NewDimensionCompat(numSlots)
+	compat.SetMode(ModePadding)
+	handler := compat.NewPaddingHandler(originalSize)
+
+	return &Phase2Wrapper{
+		handler:  handler,
+		numSlots: numSlots,
+		enabled:  true,
+	}
+}
+
+// WrapInput 包装输入数据（自动 padding）
+func (w *Phase2Wrapper) WrapInput(x []complex128, dimType string) []complex128 {
+	if !w.enabled {
+		return x
+	}
+
+	effective := w.handler.GetEffectiveDimensions()
+
+	switch dimType {
+	case "hid":
+		if len(x) < effective.hidDim {
+			return w.handler.PadInputVector(x, effective.hidDim)
+		}
+	case "exp":
+		if len(x) < effective.expDim {
+			return w.handler.PadInputVector(x, effective.expDim)
+		}
+	case "seq":
+		if len(x) < effective.seqLen {
+			return w.handler.PadInputVector(x, effective.seqLen)
+		}
+	}
+	return x
+}
+
+// UnwrapOutput 解包输出数据（自动 unpadding）
+func (w *Phase2Wrapper) UnwrapOutput(y []complex128, dimType string) []complex128 {
+	if !w.enabled {
+		return y
+	}
+
+	orig := w.handler.GetOriginalDimensions()
+
+	switch dimType {
+	case "hid":
+		return w.handler.UnpadOutputVector(y, orig.hidDim)
+	case "exp":
+		return w.handler.UnpadOutputVector(y, orig.expDim)
+	case "seq":
+		return w.handler.UnpadOutputVector(y, orig.seqLen)
+	}
+	return y
+}
+
+// WrapWeightMatrix 包装权重矩阵
+func (w *Phase2Wrapper) WrapWeightMatrix(matrix [][]complex128, rows, cols int) [][]complex128 {
+	if !w.enabled {
+		return matrix
+	}
+	return w.handler.PadWeightMatrix(matrix, rows, cols)
+}
+
+// IsPaddingNeeded 检查是否需要进行 padding
+func (w *Phase2Wrapper) IsPaddingNeeded() bool {
+	if !w.enabled {
+		return false
+	}
+	orig := w.handler.GetOriginalDimensions()
+	effective := w.handler.GetEffectiveDimensions()
+	return orig.hidDim != effective.hidDim || orig.expDim != effective.expDim
 }
 
 // =============================================================================

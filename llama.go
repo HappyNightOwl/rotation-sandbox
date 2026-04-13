@@ -32,18 +32,52 @@ type NormFunc struct {
 }
 
 type LlamaInference struct {
-	params   *ckks.Parameters
-	size     *LlamaSize
-	eval     []*ckks.Evaluator
-	btpEval  *bootstrapping.Evaluator
-	siluFunc *SiluFunc
-	normFunc *NormFunc
-	helper   *TestHelper
-	w        map[string][]*rlwe.Plaintext
-	wMsg     map[string][][]complex128
-	cache    map[string][]*rlwe.Ciphertext
-	cacheMsg map[string][][]complex128
-	mask     map[string][]*rlwe.Plaintext
+	params       *ckks.Parameters
+	size         *LlamaSize
+	originalSize *LlamaSize
+	phase2Mode   bool
+	eval         []*ckks.Evaluator
+	btpEval      *bootstrapping.Evaluator
+	siluFunc     *SiluFunc
+	normFunc     *NormFunc
+	helper       *TestHelper
+	w            map[string][]*rlwe.Plaintext
+	wMsg         map[string][][]complex128
+	cache        map[string][]*rlwe.Ciphertext
+	cacheMsg     map[string][][]complex128
+	mask         map[string][]*rlwe.Plaintext
+}
+
+func (llama *LlamaInference) UnpadOutput(msg []complex128, dimType string) []complex128 {
+	if !llama.phase2Mode || llama.originalSize == nil {
+		return msg
+	}
+	orig := llama.originalSize
+	effective := llama.size
+
+	switch dimType {
+	case "hid":
+		if orig.hidDim != effective.hidDim {
+			numSlots := len(msg)
+			stride := numSlots / effective.hidDim
+			unpadded := make([]complex128, orig.hidDim)
+			for i := 0; i < orig.hidDim; i++ {
+				unpadded[i] = msg[i*stride]
+			}
+			return unpadded
+		}
+	case "exp":
+		if orig.expDim != effective.expDim {
+			numSlots := len(msg)
+			stride := numSlots / effective.expDim
+			unpadded := make([]complex128, orig.expDim)
+			for i := 0; i < orig.expDim; i++ {
+				unpadded[i] = msg[i*stride]
+			}
+			return unpadded
+		}
+	}
+	return msg
 }
 
 func (llama *LlamaInference) DecoderMoai(x *rlwe.Ciphertext) (y *rlwe.Ciphertext) {

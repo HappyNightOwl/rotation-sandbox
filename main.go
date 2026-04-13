@@ -25,6 +25,8 @@ var (
 	configPath = flag.String("config", "config.json", "path to configuration file")
 	// 新增：生成默认配置文件模板
 	generateConfig = flag.String("gen-config", "", "generate default config template to specified path and exit")
+	// 新增：Phase 2 模式开关
+	phase2 = flag.Bool("phase2", false, "enable Phase 2 Zero-Padding mode (default: Phase 1 align mode)")
 )
 
 func main() {
@@ -59,22 +61,44 @@ func main() {
 	}
 	config.ApplyOverrides(overrides)
 
-	// ===== Phase 1: 自动维度对齐 =====
-	// 在创建 CKKS 参数前，对齐模型维度以满足 numSlots 整除约束
-	numSlots := 1 << config.Crypto.LogN // 2^LogN
-	compat := NewDimensionCompat(numSlots)
-	aligned := compat.AlignLlamaSize(LlamaSize{
-		hidDim:   config.Model.HiddenDim,
-		expDim:   config.Model.ExpandedDim,
-		seqLen:   config.Model.SeqLen,
-		numHeads: config.Model.NumHeads,
-	})
-	// 应用对齐后的维度
-	config.Model.HiddenDim = aligned.HidDim.Aligned
-	config.Model.ExpandedDim = aligned.ExpDim.Aligned
-	// 打印对齐信息
-	compat.PrintAlignmentInfo(aligned)
-	// ================================
+	// ===== 维度兼容性处理 =====
+	numSlots := 1 << config.Crypto.LogN
+	var origSize LlamaSize
+
+	if *phase2 {
+		fmt.Println(">>> Phase 2: Zero-Padding Mode <<<")
+		compat := NewDimensionCompat(numSlots)
+		compat.SetMode(ModePadding)
+		origSize = LlamaSize{
+			hidDim:   config.Model.HiddenDim,
+			expDim:   config.Model.ExpandedDim,
+			seqLen:   config.Model.SeqLen,
+			numHeads: config.Model.NumHeads,
+		}
+		handler := compat.NewPaddingHandler(&origSize)
+		effective := handler.GetEffectiveDimensions()
+		origHid, padHid, origExp, padExp := handler.GetPaddingInfo()
+
+		fmt.Printf("Phase 2 Zero-Padding:\n")
+		fmt.Printf("  hidDim: %d → %d (padded)\n", origHid, padHid)
+		fmt.Printf("  expDim: %d → %d (padded)\n", origExp, padExp)
+		fmt.Printf("  effective dimensions will be used for FHE operations\n")
+
+		config.Model.HiddenDim = effective.hidDim
+		config.Model.ExpandedDim = effective.expDim
+	} else {
+		fmt.Println(">>> Phase 1: Auto-Align Mode <<<")
+		compat := NewDimensionCompat(numSlots)
+		aligned := compat.AlignLlamaSize(LlamaSize{
+			hidDim:   config.Model.HiddenDim,
+			expDim:   config.Model.ExpandedDim,
+			seqLen:   config.Model.SeqLen,
+			numHeads: config.Model.NumHeads,
+		})
+		config.Model.HiddenDim = aligned.HidDim.Aligned
+		config.Model.ExpandedDim = aligned.ExpDim.Aligned
+		compat.PrintAlignmentInfo(aligned)
+	}
 
 	// 打印当前配置（便于调试）
 	fmt.Printf("=== Running with Configuration ===\n")
@@ -104,8 +128,12 @@ func main() {
 		Xs:   params.Xs(),
 	}
 
-	// 传递配置到 PrepareContext
-	llama, helper, size, opeval := PrepareContextWithConfig(params, btpParametersLit, config)
+	var phase2Wrapper *Phase2Wrapper
+	if *phase2 {
+		phase2Wrapper = NewPhase2Wrapper(numSlots, &origSize)
+	}
+
+	llama, helper, size, opeval := PrepareContextWithConfig(params, btpParametersLit, config, phase2Wrapper)
 
 	fmt.Print("Initialization finished!\n")
 	x := helper.ctGen(1)[0]

@@ -121,7 +121,7 @@ func setupStage1Context(t *testing.T) *stage1Context {
 		Xs:   params.Xs(),
 	}
 
-	llama, helper, size, _ := PrepareContextWithConfig(params, bpLit, config)
+	llama, helper, size, _ := PrepareContextWithConfig(params, bpLit, config, nil)
 	helper.PrepareWeights(size, []string{"q", "k", "v", "out", "up", "gate", "down", "RoPE"}, llama)
 	helper.PrepareCache(size, []string{"k", "v"}, llama)
 

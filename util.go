@@ -174,8 +174,7 @@ func PrepareContext(params ckks.Parameters, btpParametersLit bootstrapping.Param
 	return llama, helper, size, opeval
 }
 
-// PrepareContextWithConfig 使用配置文件创建上下文
-func PrepareContextWithConfig(params ckks.Parameters, btpParametersLit bootstrapping.ParametersLiteral, config *Config) (llama *LlamaInference, helper *TestHelper, size *LlamaSize, opeval *OperationEvaluator) {
+func PrepareContextWithConfig(params ckks.Parameters, btpParametersLit bootstrapping.ParametersLiteral, config *Config, phase2Wrapper *Phase2Wrapper) (llama *LlamaInference, helper *TestHelper, size *LlamaSize, opeval *OperationEvaluator) {
 	fmt.Print("Preparing context with config...\n")
 
 	kgen := rlwe.NewKeyGenerator(params)
@@ -194,7 +193,6 @@ func PrepareContextWithConfig(params ckks.Parameters, btpParametersLit bootstrap
 	for i := 1; i < params.MaxSlots(); i *= 2 {
 		galEls = append(galEls, params.GaloisElement(i))
 	}
-	// Generate Galois keys once and share across all evaluators (keys are read-only)
 	sharedEvk := rlwe.NewMemEvaluationKeySet(rlk, kgen.GenGaloisKeysNew(galEls, sk)...)
 	for i := range eval {
 		eval[i] = ckks.NewEvaluator(params, sharedEvk)
@@ -210,15 +208,24 @@ func PrepareContextWithConfig(params ckks.Parameters, btpParametersLit bootstrap
 
 	helper = &TestHelper{encoder: encoder, encryptor: encryptor, decryptor: decryptor, params: &params}
 	size = config.Model.ToLlamaSize()
+	var originalSize *LlamaSize
+	phase2Mode := false
+	if phase2Wrapper != nil {
+		phase2Mode = true
+		orig := phase2Wrapper.handler.GetOriginalDimensions()
+		originalSize = &orig
+	}
 	llama = &LlamaInference{
-		size:    size,
-		eval:    eval,
-		btpEval: btpEval,
-		params:  &params,
-		helper:  helper,
-		w:       make(map[string][]*rlwe.Plaintext),
-		cache:   make(map[string][]*rlwe.Ciphertext),
-		mask:    make(map[string][]*rlwe.Plaintext),
+		size:         size,
+		originalSize: originalSize,
+		phase2Mode:   phase2Mode,
+		eval:         eval,
+		btpEval:      btpEval,
+		params:       &params,
+		helper:       helper,
+		w:            make(map[string][]*rlwe.Plaintext),
+		cache:        make(map[string][]*rlwe.Ciphertext),
+		mask:         make(map[string][]*rlwe.Plaintext),
 	}
 	fmt.Printf("Residual parameters: logN=%d, logSlots=%d, H=%d, sigma=%f, logQP=%f, levels=%d, scale=2^%d\n",
 		btpParams.ResidualParameters.LogN(),
@@ -253,7 +260,7 @@ func (helper *TestHelper) ctGen(n int) (ctVec []*rlwe.Ciphertext) {
 	for i := 1; i <= n; i++ {
 		message := make([]float64, helper.params.MaxSlots())
 		for i := range message {
-			if i % 4 == 0 {
+			if i%4 == 0 {
 				message[i] = sampling.RandFloat64(-10, 10)
 			} else {
 				message[i] = 0.0
@@ -336,7 +343,7 @@ func (helper *TestHelper) idxPtGen() (ptVec []*rlwe.Plaintext) {
 	message := make([]complex128, helper.params.MaxSlots())
 
 	for i := range message {
-		message[i] = complex(float64((i / 8) % 16) - 8, float64((i / 8) / 16) - 8)
+		message[i] = complex(float64((i/8)%16)-8, float64((i/8)/16)-8)
 	}
 	plaintext := ckks.NewPlaintext(*(helper.params), *level)
 	if err := helper.encoder.Encode(message, plaintext); err != nil {
@@ -362,7 +369,7 @@ func (helper *TestHelper) Dec(ciphertext *rlwe.Ciphertext, n int) []complex128 {
 		fmt.Printf("%.4f; ", real(msg[i]))
 	}
 	fmt.Printf("\n")
-	
+
 	return msg
 }
 
@@ -383,7 +390,7 @@ func (helper *TestHelper) MSE(msg1 []complex128, msg2 []complex128) (d float64) 
 	fmt.Print("\n")
 	fmt.Printf("Error: %f\n", err)
 	fmt.Printf("Precision: %.2f bits\n", -math.Log2(err))
-	return 
+	return
 }
 
 // Neg negates a ciphertext in-place without changing its scale
@@ -481,9 +488,9 @@ func (helper *TestHelper) encryptCiphertext(weights [][]complex128) (ctVec []*rl
 }
 
 func (helper *TestHelper) PrepareWeights(size *LlamaSize, weights []string, llama *LlamaInference) {
-    if llama.wMsg == nil {
-        llama.wMsg = make(map[string][][]complex128)
-    }
+	if llama.wMsg == nil {
+		llama.wMsg = make(map[string][][]complex128)
+	}
 
 	fmt.Print("Preparing weights...\n")
 	for _, name := range weights {
@@ -504,9 +511,6 @@ func (helper *TestHelper) PrepareWeights(size *LlamaSize, weights []string, llam
 }
 
 func readWeightsFromFile(size *LlamaSize, expand int) (weights [][]complex128) {
-	// In actual implementation, this function would read weights from a file.
-	// Here we return a dummy weight matrix for demonstration purposes.
-
 	weights = [][]complex128{}
 	dim1, dim2 := size.hidDim, size.hidDim
 	if expand < 0 {
@@ -524,13 +528,46 @@ func readWeightsFromFile(size *LlamaSize, expand int) (weights [][]complex128) {
 	return
 }
 
+func readWeightsFromFilePhase2(size *LlamaSize, originalSize *LlamaSize, expand int) [][]complex128 {
+	origWeights := [][]complex128{}
+	dim1, dim2 := originalSize.hidDim, originalSize.hidDim
+	if expand < 0 {
+		dim2 = originalSize.expDim
+	} else if expand > 0 {
+		dim1 = originalSize.expDim
+	}
+	for i := 0; i < dim1; i++ {
+		row := make([]complex128, dim2)
+		for j := 0; j < dim2; j++ {
+			row[j] = complex(0.01, 0)
+		}
+		origWeights = append(origWeights, row)
+	}
+	return origWeights
+}
+
 // Core function for weight encoding
 func (helper *TestHelper) readWeightsLinear(name string, size *LlamaSize, llama *LlamaInference, expand int, filePath string) {
 	hidDim := size.hidDim
 	expDim := size.expDim
 	numSlots := llama.params.MaxSlots()
 	fmt.Printf("Generating weights matrix for %s...\n", name)
-	weightMatrix := readWeightsFromFile(size, expand)
+
+	var weightMatrix [][]complex128
+	if llama.phase2Mode && llama.originalSize != nil {
+		origW := readWeightsFromFilePhase2(size, llama.originalSize, expand)
+		compat := NewDimensionCompat(numSlots)
+		handler := compat.NewPaddingHandler(&LlamaSize{hidDim: hidDim, expDim: expDim})
+		targetDim1, targetDim2 := hidDim, hidDim
+		if expand < 0 {
+			targetDim2 = expDim
+		} else if expand > 0 {
+			targetDim1 = expDim
+		}
+		weightMatrix = handler.PadWeightMatrix(origW, targetDim1, targetDim2)
+	} else {
+		weightMatrix = readWeightsFromFile(size, expand)
+	}
 	weightPoly := make([][]complex128, 0)
 	var batch, inRot, outRot int
 
@@ -540,7 +577,7 @@ func (helper *TestHelper) readWeightsLinear(name string, size *LlamaSize, llama 
 		batch = numSlots / hidDim
 	} else {
 		inRot = int(math.Sqrt(float64(hidDim * expDim / (2 * numSlots))))
-		for (hidDim * expDim / (2 * numSlots)) % inRot != 0 {
+		for (hidDim*expDim/(2*numSlots))%inRot != 0 {
 			inRot--
 		}
 		outRot = hidDim * expDim / (numSlots * inRot)
@@ -555,28 +592,28 @@ func (helper *TestHelper) readWeightsLinear(name string, size *LlamaSize, llama 
 				// l determines the position within the diagonal
 				if expand == 0 {
 					for l := 0; l < hidDim; l++ {
-						idx := (k + batch * (l + i * inRot * batch)) % numSlots
-						poly[idx] = weightMatrix[l][(k + j * batch + i * inRot * batch + l) % hidDim]
+						idx := (k + batch*(l+i*inRot*batch)) % numSlots
+						poly[idx] = weightMatrix[l][(k+j*batch+i*inRot*batch+l)%hidDim]
 					}
 				} else if expand > 0 {
 					for l := 0; l < expDim; l++ {
 						// The output follows the order 0, d, 2d, ..., 1, d+1, ..., (a-1)d, ..., ad-1
-						idx := (k + l / hidDim * batch + batch * (expDim / hidDim) * (l % hidDim + i * inRot * batch)) % numSlots
-						poly[idx] = weightMatrix[(l + l / hidDim * batch) % expDim][(k + j * batch + i * inRot * batch + l + l / hidDim * batch) % hidDim]
+						idx := (k + l/hidDim*batch + batch*(expDim/hidDim)*(l%hidDim+i*inRot*batch)) % numSlots
+						poly[idx] = weightMatrix[(l+l/hidDim*batch)%expDim][(k+j*batch+i*inRot*batch+l+l/hidDim*batch)%hidDim]
 					}
 				} else {
 					// Down: weight is (hidDim, expDim), input is expDim, output is hidDim
 					// Key insight: idx calculation must use batchHid = numSlots/hidDim to match expand>0 pattern
 					// But k iterates over numSlots/expDim since input is packed at expDim density
-					batchHid := numSlots / hidDim  // = 4 when numSlots=128, hidDim=32
+					batchHid := numSlots / hidDim // = 4 when numSlots=128, hidDim=32
 					for l := 0; l < expDim; l++ {
 						// l maps to: outGroup = which output chunk, outPos = position within chunk
-						outGroup := l / hidDim  // 0 or 1
+						outGroup := l / hidDim // 0 or 1
 						outPos := l % hidDim   // 0 to 31
 						// idx uses batchHid to match expand>0 slot layout
-						idx := (k + outGroup * batchHid + batchHid * (expDim / hidDim) * (outPos + i * inRot * batchHid)) % numSlots
+						idx := (k + outGroup*batchHid + batchHid*(expDim/hidDim)*(outPos+i*inRot*batchHid)) % numSlots
 						// Row: output dimension, accounting for rotation
-						rowIdx := (outPos + i * inRot * batchHid) % hidDim
+						rowIdx := (outPos + i*inRot*batchHid) % hidDim
 						// Col: input dimension = outGroup * hidDim + outPos, plus rotation offset from k and j
 						// k ranges over numSlots/expDim, j ranges over inRot
 						// Rotation offset: k * (expDim/numSlots) * expDim + j * (expDim/numSlots) * numSlots?
@@ -605,16 +642,16 @@ func (helper *TestHelper) prepareRoPE(size *LlamaSize, llama *LlamaInference) {
 	hidDim := size.hidDim
 	seqLen := size.seqLen
 	numSlot := helper.params.MaxSlots()
-	
+
 	cos := make([]complex128, numSlot)
 	sin0 := make([]complex128, numSlot)
 	sin1 := make([]complex128, numSlot)
-	for i := 0; i < hidDim / 2; i++ {
+	for i := 0; i < hidDim/2; i++ {
 		theta := float64(seqLen) * (1.0 / math.Pow(10000, float64(2*i)/float64(hidDim)))
-		cos[2 * i * numSlot / hidDim] = complex(math.Cos(theta), 0)
-		sin0[2 * i * numSlot / hidDim] = complex(math.Sin(theta), 0)
-		cos[(2 * i + 1) * numSlot / hidDim] = complex(math.Cos(theta), 0)
-		sin1[(2 * i + 1) * numSlot / hidDim] = -complex(math.Sin(theta), 0)
+		cos[2*i*numSlot/hidDim] = complex(math.Cos(theta), 0)
+		sin0[2*i*numSlot/hidDim] = complex(math.Sin(theta), 0)
+		cos[(2*i+1)*numSlot/hidDim] = complex(math.Cos(theta), 0)
+		sin1[(2*i+1)*numSlot/hidDim] = -complex(math.Sin(theta), 0)
 	}
 
 	llama.w["RoPE"] = []*rlwe.Plaintext{}
@@ -677,16 +714,16 @@ func (helper *TestHelper) readCache(name string, size *LlamaSize, llama *LlamaIn
 		if needed := (seqLen + batch) / batch; needed > cacheLen {
 			cacheLen = needed
 		}
-		maskPeriod := numHeads * numSlots / hidDim  // mask pattern period
+		maskPeriod := numHeads * numSlots / hidDim // mask pattern period
 		for i := 0; i < cacheLen; i++ {
 			poly := make([]complex128, numSlots)
 			mask := make([]complex128, numSlots)
 
-			if i < (seqLen + numSlots / hidDim - 1) * hidDim / numSlots {
-				for j := 0; j < numSlots / hidDim; j++ {
+			if i < (seqLen+numSlots/hidDim-1)*hidDim/numSlots {
+				for j := 0; j < numSlots/hidDim; j++ {
 					for k := 0; k < hidDim; k++ {
-						if j + i * numSlots / hidDim < len(cacheMatrix) {
-							poly[j + k * numSlots / hidDim] = cacheMatrix[j + i * numSlots / hidDim][k]
+						if j+i*numSlots/hidDim < len(cacheMatrix) {
+							poly[j+k*numSlots/hidDim] = cacheMatrix[j+i*numSlots/hidDim][k]
 						}
 					}
 				}
@@ -698,7 +735,7 @@ func (helper *TestHelper) readCache(name string, size *LlamaSize, llama *LlamaIn
 			// Mask wraps with period maskPeriod for extended cache indices
 			maskOffset := (i % (hidDim / numHeads)) * maskPeriod
 			for j := 0; j < numSlots; j++ {
-				if j >= maskOffset && j < maskOffset + maskPeriod {
+				if j >= maskOffset && j < maskOffset+maskPeriod {
 					mask[j] = 1
 				} else {
 					mask[j] = 0
@@ -719,19 +756,19 @@ func (helper *TestHelper) readCache(name string, size *LlamaSize, llama *LlamaIn
 			inRot--
 		}
 		outRot := cacheLen / inRot
-		
+
 		// i and j determine the "block diagonal" index
 		for i := 0; i < outRot; i++ {
 			for j := 0; j < inRot; j++ {
 				poly := make([]complex128, numSlots)
 				// k and l determine the position within one block
 				for k := 0; k < numHeads; k++ {
-					for l := 0; l < numSlots / hidDim; l++ {
+					for l := 0; l < numSlots/hidDim; l++ {
 						// m determines the block in the diagonal
 						for m := 0; m < cacheLen; m++ {
-							idx := (l + k * numSlots / hidDim + m * numSlots * numHeads / hidDim) % numSlots
-							row := ((m + j) * numSlots / hidDim + l) % (numSlots / numHeads)
-							col := (((hidDim - numHeads + m - i * inRot) % (hidDim - numHeads)) * numHeads + k) % hidDim
+							idx := (l + k*numSlots/hidDim + m*numSlots*numHeads/hidDim) % numSlots
+							row := ((m+j)*numSlots/hidDim + l) % (numSlots / numHeads)
+							col := (((hidDim-numHeads+m-i*inRot)%(hidDim-numHeads))*numHeads + k) % hidDim
 							if row < seqLen {
 								poly[idx] = cacheMatrix[row][col]
 							} else {
@@ -746,7 +783,7 @@ func (helper *TestHelper) readCache(name string, size *LlamaSize, llama *LlamaIn
 
 		mask := make([]complex128, numSlots)
 		for i := 0; i < numSlots; i++ {
-			if i % (numSlots / hidDim) == 0 {
+			if i%(numSlots/hidDim) == 0 {
 				mask[i] = 1
 			} else {
 				mask[i] = 0
@@ -790,7 +827,7 @@ func (opeval *OperationEvaluator) add() {
 		}
 	}
 	elapsed := time.Since(start)
-	fmt.Printf("Addition Consumed %f seconds with level %d\n", elapsed.Seconds() / float64(len(ctVec)), *level)
+	fmt.Printf("Addition Consumed %f seconds with level %d\n", elapsed.Seconds()/float64(len(ctVec)), *level)
 }
 
 func (opeval *OperationEvaluator) ctPtMult() {
@@ -809,7 +846,7 @@ func (opeval *OperationEvaluator) ctPtMult() {
 		opeval.eval.Rescale(ctVec[i], ctTmp)
 	}
 	elapsed := time.Since(start)
-	fmt.Printf("Ct-pt multiplication Consumed %f seconds with level %d\n", elapsed.Seconds() / float64(len(ctVec)), *level)
+	fmt.Printf("Ct-pt multiplication Consumed %f seconds with level %d\n", elapsed.Seconds()/float64(len(ctVec)), *level)
 }
 
 func (opeval *OperationEvaluator) ctCtMult() {
@@ -827,7 +864,7 @@ func (opeval *OperationEvaluator) ctCtMult() {
 		opeval.eval.Rescale(ctVec[i], ctTmp)
 	}
 	elapsed := time.Since(start)
-	fmt.Printf("Ct-ct multiplication Consumed %f seconds with level %d\n", elapsed.Seconds() / float64(len(ctVec)), *level)
+	fmt.Printf("Ct-ct multiplication Consumed %f seconds with level %d\n", elapsed.Seconds()/float64(len(ctVec)), *level)
 }
 
 func (opeval *OperationEvaluator) rotate() {
@@ -838,13 +875,13 @@ func (opeval *OperationEvaluator) rotate() {
 		opeval.eval.RotateNew(ctVec[i], 5)
 	}
 	elapsed := time.Since(start)
-	fmt.Printf("Rotation Consumed %f seconds with level %d\n", elapsed.Seconds() / float64(len(ctVec)), *level)
+	fmt.Printf("Rotation Consumed %f seconds with level %d\n", elapsed.Seconds()/float64(len(ctVec)), *level)
 
 	start = time.Now()
 	nums := slices.Repeat([]int{5}, len(ctVec))
 	opeval.eval.RotateHoistedNew(ctVec[0], nums)
 	elapsed = time.Since(start)
-	fmt.Printf("Hoisted rotation Consumed %f seconds with level %d\n", elapsed.Seconds() / float64(len(ctVec)), *level)
+	fmt.Printf("Hoisted rotation Consumed %f seconds with level %d\n", elapsed.Seconds()/float64(len(ctVec)), *level)
 }
 
 func (opeval *OperationEvaluator) drop() {
@@ -855,7 +892,7 @@ func (opeval *OperationEvaluator) drop() {
 		opeval.eval.DropLevelNew(ctVec[i], 1)
 	}
 	elapsed := time.Since(start)
-	fmt.Printf("Level drop Consumed %f seconds with level %d\n", elapsed.Seconds() / float64(len(ctVec)), *level)
+	fmt.Printf("Level drop Consumed %f seconds with level %d\n", elapsed.Seconds()/float64(len(ctVec)), *level)
 }
 
 func (opeval *OperationEvaluator) boot() {
