@@ -569,63 +569,85 @@ func (helper *TestHelper) readWeightsLinear(name string, size *LlamaSize, llama 
 		weightMatrix = readWeightsFromFile(size, expand)
 	}
 	weightPoly := make([][]complex128, 0)
-	var batch, inRot, outRot int
-
-	if expand == 0 {
-		inRot = int(math.Sqrt(float64(hidDim * hidDim / (2 * numSlots))))
-		outRot = hidDim * hidDim / (numSlots * inRot)
-		batch = numSlots / hidDim
-	} else {
-		inRot = int(math.Sqrt(float64(hidDim * expDim / (2 * numSlots))))
-		for (hidDim*expDim/(2*numSlots))%inRot != 0 {
-			inRot--
-		}
-		outRot = hidDim * expDim / (numSlots * inRot)
+	plan := buildLinearPlan(numSlots, hidDim, expDim, expand)
+	inputDim := hidDim
+	outputDim := hidDim
+	batch := numSlots / hidDim
+	if expand < 0 {
+		inputDim = expDim
 		batch = numSlots / expDim
+	} else if expand > 0 {
+		outputDim = expDim
+		batch = numSlots / expDim
+	}
+	if batch < 1 {
+		batch = 1
+	}
+	if outputDim <= 0 {
+		outputDim = 1
+	}
+	rows := len(weightMatrix)
+	cols := 0
+	if rows > 0 {
+		cols = len(weightMatrix[0])
 	}
 
 	// i, j and k determine the diagonal index
-	for i := 0; i < outRot; i++ {
-		for j := 0; j < inRot; j++ {
+	for i := 0; i < plan.outRot; i++ {
+		for j := 0; j < plan.inRot; j++ {
 			poly := make([]complex128, numSlots)
+			diagIdx := i*plan.inRot + j
+			if diagIdx >= plan.validMult {
+				weightPoly = append(weightPoly, poly)
+				continue
+			}
 			for k := 0; k < batch; k++ {
-				// l determines the position within the diagonal
-				if expand == 0 {
-					for l := 0; l < hidDim; l++ {
-						idx := (k + batch*(l+i*inRot*batch)) % numSlots
-						poly[idx] = weightMatrix[l][(k+j*batch+i*inRot*batch+l)%hidDim]
+				if plan.legacy {
+					// Preserve the original packing for regular dimensions; only guard the tail.
+					if expand == 0 {
+						for l := 0; l < hidDim; l++ {
+							idx := (k + batch*(l+i*plan.inRot*batch)) % numSlots
+							colIdx := (k + j*batch + i*plan.inRot*batch + l) % hidDim
+							if l < rows && colIdx < cols {
+								poly[idx] = weightMatrix[l][colIdx]
+							}
+						}
+					} else if expand > 0 {
+						for l := 0; l < expDim; l++ {
+							idx := (k + l/hidDim*batch + batch*(expDim/hidDim)*(l%hidDim+i*plan.inRot*batch)) % numSlots
+							rowIdx := (l + l/hidDim*batch) % expDim
+							colIdx := (k + j*batch + i*plan.inRot*batch + l + l/hidDim*batch) % hidDim
+							if rowIdx < rows && colIdx < cols {
+								poly[idx] = weightMatrix[rowIdx][colIdx]
+							}
+						}
+					} else {
+						batchHid := numSlots / hidDim
+						for l := 0; l < expDim; l++ {
+							outGroup := l / hidDim
+							outPos := l % hidDim
+							idx := (k + outGroup*batchHid + batchHid*(expDim/hidDim)*(outPos+i*plan.inRot*batchHid)) % numSlots
+							rowIdx := (outPos + i*plan.inRot*batchHid) % hidDim
+							colIdx := (outGroup*hidDim + outPos + k*(hidDim/(numSlots/expDim)) + j*(numSlots/expDim)) % expDim
+							if rowIdx < rows && colIdx < cols {
+								poly[idx] = weightMatrix[rowIdx][colIdx]
+							}
+						}
 					}
-				} else if expand > 0 {
-					for l := 0; l < expDim; l++ {
-						// The output follows the order 0, d, 2d, ..., 1, d+1, ..., (a-1)d, ..., ad-1
-						idx := (k + l/hidDim*batch + batch*(expDim/hidDim)*(l%hidDim+i*inRot*batch)) % numSlots
-						poly[idx] = weightMatrix[(l+l/hidDim*batch)%expDim][(k+j*batch+i*inRot*batch+l+l/hidDim*batch)%hidDim]
+					continue
+				}
+
+				// Fallback for irregular dimensions: keep only in-range coefficients and zero the tail.
+				for l := 0; l < outputDim; l++ {
+					rawIdx := k + batch*(l+i*plan.inRot*batch)
+					if rawIdx < 0 || rawIdx >= numSlots {
+						continue
 					}
-				} else {
-					// Down: weight is (hidDim, expDim), input is expDim, output is hidDim
-					// Key insight: idx calculation must use batchHid = numSlots/hidDim to match expand>0 pattern
-					// But k iterates over numSlots/expDim since input is packed at expDim density
-					batchHid := numSlots / hidDim // = 4 when numSlots=128, hidDim=32
-					for l := 0; l < expDim; l++ {
-						// l maps to: outGroup = which output chunk, outPos = position within chunk
-						outGroup := l / hidDim // 0 or 1
-						outPos := l % hidDim   // 0 to 31
-						// idx uses batchHid to match expand>0 slot layout
-						idx := (k + outGroup*batchHid + batchHid*(expDim/hidDim)*(outPos+i*inRot*batchHid)) % numSlots
-						// Row: output dimension, accounting for rotation
-						rowIdx := (outPos + i*inRot*batchHid) % hidDim
-						// Col: input dimension = outGroup * hidDim + outPos, plus rotation offset from k and j
-						// k ranges over numSlots/expDim, j ranges over inRot
-						// Rotation offset: k * (expDim/numSlots) * expDim + j * (expDim/numSlots) * numSlots?
-						// Simpler: colIdx = outGroup * hidDim + outPos + k * (hidDim/(numSlots/expDim)) + j * (numSlots/expDim)?
-						// Actually, look at expand>0: colIdx = (k + j*batch + i*inRot*batch + l + l/hidDim*batch) % hidDim
-						// For expand=-1, symmetric: colIdx = (k * (expDim/numSlots) + j * batch + ...) % expDim?
-						// Let me try: k contributes expDim/(numSlots/hidDim) = expDim*hidDim/numSlots = hidDim/(numSlots/expDim)
-						// batchInput = numSlots / expDim
-						// colIdx = outGroup * hidDim + outPos + k * (hidDim/batch) + j * batch?
-						colIdx := (outGroup*hidDim + outPos + k*(hidDim/(numSlots/expDim)) + j*(numSlots/expDim)) % expDim
-						poly[idx] = weightMatrix[rowIdx][colIdx]
+					colIdx := k + j*batch + i*plan.inRot*batch + l
+					if l >= rows || colIdx < 0 || colIdx >= cols || colIdx >= inputDim {
+						continue
 					}
+					poly[rawIdx] = weightMatrix[l][colIdx]
 				}
 			}
 			weightPoly = append(weightPoly, poly)

@@ -10,65 +10,139 @@ import (
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 )
 
+type linearPlan struct {
+	preProc   int
+	postProc  int
+	inRot     int
+	outRot    int
+	rotStep   int
+	validMult int
+	legacy    bool
+}
+
+func ceilDiv(a, b int) int {
+	if b <= 0 {
+		return 0
+	}
+	return (a + b - 1) / b
+}
+
+func pickLinearBlocks(numDiags int) (inRot, outRot int) {
+	if numDiags <= 0 {
+		return 1, 1
+	}
+	inRot = int(math.Sqrt(float64(numDiags)))
+	if inRot < 1 {
+		inRot = 1
+	}
+	for inRot > 1 && numDiags%inRot != 0 {
+		inRot--
+	}
+	outRot = ceilDiv(numDiags, inRot)
+	return
+}
+
+func legacyLinearBlocks(numSlots, hidDim, expDim, expand int) (inRot, outRot int, ok bool) {
+	base := hidDim * hidDim
+	if expand != 0 {
+		base = hidDim * expDim
+	}
+	denom := 2 * numSlots
+	if denom <= 0 || base < denom || base%denom != 0 {
+		return 0, 0, false
+	}
+	factor := base / denom
+	if factor <= 0 {
+		return 0, 0, false
+	}
+	inRot = int(math.Sqrt(float64(factor)))
+	if inRot < 1 {
+		return 0, 0, false
+	}
+	for factor%inRot != 0 {
+		inRot--
+		if inRot < 1 {
+			return 0, 0, false
+		}
+	}
+	outRot = base / (numSlots * inRot)
+	return inRot, outRot, outRot > 0
+}
+
+func buildLinearPlan(numSlots, hidDim, expDim, expand int) linearPlan {
+	inputDim := hidDim
+	outputDim := hidDim
+	if expand < 0 {
+		inputDim = expDim
+	} else if expand > 0 {
+		outputDim = expDim
+	}
+
+	preProc := numSlots / inputDim
+	if preProc < 1 {
+		preProc = 1
+	}
+	postProc := numSlots / outputDim
+	if postProc < 1 {
+		postProc = 1
+	}
+
+	inRot, outRot, legacy := legacyLinearBlocks(numSlots, hidDim, expDim, expand)
+	validMult := 0
+	if legacy {
+		validMult = inRot * outRot
+	} else {
+		validMult = ceilDiv(inputDim*outputDim, numSlots)
+		inRot, outRot = pickLinearBlocks(validMult)
+	}
+
+	return linearPlan{
+		preProc:   preProc,
+		postProc:  postProc,
+		inRot:     inRot,
+		outRot:    outRot,
+		rotStep:   preProc * postProc,
+		validMult: validMult,
+		legacy:    legacy,
+	}
+}
+
 func (llama *LlamaInference) Linear(xPtr *rlwe.Ciphertext, wStr string, expand int) (y *rlwe.Ciphertext) {
 	eval := llama.eval
 
-	var preProc, postProc, inRot, outRot, rotStep int
 	numSlots := llama.params.MaxSlots()
 	hidDim := llama.size.hidDim
 	expDim := llama.size.expDim
-	if expand >= 0 {
-		preProc = numSlots / hidDim
-	} else {
-		preProc = numSlots / expDim
-	}
-	if expand <= 0 {
-		postProc = numSlots / hidDim
-		rotStep = preProc * postProc
-	} else {
-		postProc = numSlots / expDim
-		rotStep = preProc * postProc
-	}
-	if expand == 0 {
-		inRot = int(math.Sqrt(float64(hidDim * hidDim / (2 * numSlots))))
-		outRot = hidDim * hidDim / (numSlots * inRot)
-	} else {
-		inRot = int(math.Sqrt(float64(hidDim * expDim / (2 * numSlots))))
-		for (hidDim * expDim / (2 * numSlots)) % inRot != 0 {
-			inRot--
-		}
-		outRot = hidDim * expDim / (numSlots * inRot)
-	}
+	plan := buildLinearPlan(numSlots, hidDim, expDim, expand)
 
 	weight := llama.w[wStr]
 	x := xPtr.CopyNew()
-	ctRot := make([]*rlwe.Ciphertext, inRot)
+	ctRot := make([]*rlwe.Ciphertext, plan.inRot)
 	partSum := make([]*rlwe.Ciphertext, len(weight))
-	// fmt.Printf("preProc = %d, input_rot = %d, output_rot = %d, mult = %d\n", preProc, inRot, outRot, len(weight))
+	// fmt.Printf("preProc = %d, input_rot = %d, output_rot = %d, mult = %d\n", plan.preProc, plan.inRot, plan.outRot, len(weight))
 
-	for i := 1; i < preProc; i *= 2 { // inter rot
+	for i := 1; i < plan.preProc; i *= 2 { // inter rot
 		tmp := x.CopyNew()
-		// eval[0].Rotate(x, i * (preProc - 1), tmp)
-		rotateAnyStep(eval[0], x, i * (preProc - 1), tmp)
+		rotateAnyStep(eval[0], x, i*(plan.preProc-1), tmp)
 		eval[0].Add(x, tmp, x)
 	}
 	
-	for i := 0; i < inRot; i++ { // input rot
+	for i := 0; i < plan.inRot; i++ { // input rot
 		ctRot[i] = x.CopyNew()
-		rotateAnyStep(eval[0], x, rotStep, x)
+		rotateAnyStep(eval[0], x, plan.rotStep, x)
 	}
 
 
 	if *parallel {
 		var wg sync.WaitGroup
 		numThreads := runtime.GOMAXPROCS(0)
-		if numThreads > inRot {
-			numThreads = inRot
+		if numThreads > plan.inRot {
+			numThreads = plan.inRot
 		}
 		sem := make(chan struct{}, numThreads)
 		chunkSize := (len(weight) + numThreads - 1) / numThreads
-		if chunkSize%inRot != 0 {
-			chunkSize = ((chunkSize + inRot - 1) / inRot) * inRot
+		if plan.inRot > 0 && chunkSize%plan.inRot != 0 {
+			chunkSize = ((chunkSize + plan.inRot - 1) / plan.inRot) * plan.inRot
 		}
 		for t := 0; t < numThreads; t++ {
 			startIdx := t * chunkSize
@@ -84,10 +158,10 @@ func (llama *LlamaInference) Linear(xPtr *rlwe.Ciphertext, wStr string, expand i
 				defer func() { <-sem }()
 				localEval := eval[tid%runtime.GOMAXPROCS(0)]
 				for i := startIdx; i < endIdx; i++ { // mult
-					partSum[i], _ = localEval.MulRelinNew(ctRot[i%inRot], weight[i])
+					partSum[i], _ = localEval.MulRelinNew(ctRot[i%plan.inRot], weight[i])
 					localEval.Rescale(partSum[i], partSum[i])
-					if i%inRot > 0 { // input sum
-						localEval.Add(partSum[i-i%inRot], partSum[i], partSum[i-i%inRot])
+					if i%plan.inRot > 0 { // input sum
+						localEval.Add(partSum[i-i%plan.inRot], partSum[i], partSum[i-i%plan.inRot])
 					}
 				}
 			}(startIdx, endIdx, t)
@@ -95,10 +169,10 @@ func (llama *LlamaInference) Linear(xPtr *rlwe.Ciphertext, wStr string, expand i
 		wg.Wait()
 	} else {
 		for i := 0; i < len(weight); i++ { // mult
-			partSum[i], _ = eval[0].MulRelinNew(ctRot[i%inRot], weight[i])
+			partSum[i], _ = eval[0].MulRelinNew(ctRot[i%plan.inRot], weight[i])
 			eval[0].Rescale(partSum[i], partSum[i])
-			if i%inRot > 0 { // input sum
-				eval[0].Add(partSum[i-i%inRot], partSum[i], partSum[i-i%inRot])
+			if i%plan.inRot > 0 { // input sum
+				eval[0].Add(partSum[i-i%plan.inRot], partSum[i], partSum[i-i%plan.inRot])
 			}
 		}
 	}
@@ -106,32 +180,35 @@ func (llama *LlamaInference) Linear(xPtr *rlwe.Ciphertext, wStr string, expand i
 	if *parallel {
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, runtime.GOMAXPROCS(0))
-		for i := 1; i < outRot; i++ { // output rot
+		for i := 1; i < plan.outRot; i++ { // output rot
 			wg.Add(1)
 			sem <- struct{}{} 
 			go func(i int) {
 				defer wg.Done()
 				defer func() { <-sem }()
 				localEval := eval[i%runtime.GOMAXPROCS(0)]
-				// localEval.Rotate(partSum[i*inRot], i * rotStep * inRot, partSum[i*inRot])
-				rotateAnyStep(localEval, partSum[i*inRot], i * rotStep * inRot, partSum[i*inRot])
+				if idx := i * plan.inRot; idx < len(partSum) && partSum[idx] != nil {
+					rotateAnyStep(localEval, partSum[idx], i*plan.rotStep*plan.inRot, partSum[idx])
+				}
 			}(i)
 		}
 		wg.Wait()
 	} else {
-		for i := 1; i < outRot; i++ { // output rot
-			// eval[0].Rotate(partSum[i*inRot], i * rotStep * inRot, partSum[i*inRot])
-			rotateAnyStep(eval[0], partSum[i*inRot], i * rotStep * inRot, partSum[i*inRot])
+		for i := 1; i < plan.outRot; i++ { // output rot
+			if idx := i * plan.inRot; idx < len(partSum) && partSum[idx] != nil {
+				rotateAnyStep(eval[0], partSum[idx], i*plan.rotStep*plan.inRot, partSum[idx])
+			}
 		}
 	}
 
-	for i := 1; i < outRot; i++ { // output sum
-		eval[0].Add(partSum[0], partSum[i*inRot], partSum[0])
+	for i := 1; i < plan.outRot; i++ { // output sum
+		if idx := i * plan.inRot; idx < len(partSum) && partSum[idx] != nil {
+			eval[0].Add(partSum[0], partSum[idx], partSum[0])
+		}
 	}
 
-	for i := 1; i < postProc; i *= 2 { // inter sum
+	for i := 1; i < plan.postProc; i *= 2 { // inter sum
 		tmp := partSum[0].CopyNew()
-		// eval[0].Rotate(partSum[0], i, tmp)
 		rotateAnyStep(eval[0], partSum[0], i, tmp)
 		eval[0].Add(partSum[0], tmp, partSum[0])
 	}
